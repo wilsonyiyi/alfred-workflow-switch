@@ -1,0 +1,61 @@
+{
+  "name": "alfred-workflow-switch",
+  "version": "0.1.0",
+  "description": "Safely switch one Alfred workflow slot between an installed release and local source",
+  "type": "module",
+  "license": "MIT",
+  "author": {
+    "name": "Wilson",
+    "email": "willworkgogogo@gmail.com"
+  },
+  "homepage": "https://github.com/wilsonyiyi/alfred-workflow-switch#readme",
+  "bugs": {
+    "url": "https://github.com/wilsonyiyi/alfred-workflow-switch/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/wilsonyiyi/alfred-workflow-switch.git"
+  },
+  "keywords": [
+    "alfred",
+    "alfred-workflow",
+    "development",
+    "macos",
+    "symlink",
+    "workflow"
+  ],
+  "bin": {
+    "alfred-workflow-switch": "bin/alfred-workflow-switch.js"
+  },
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "files": [
+    "bin",
+    "src",
+    "LICENSE",
+    "README.md"
+  ],
+  "scripts": {
+    "check": "npm test && npm run validate",
+    "prepublishOnly": "npm run check",
+    "release": "semantic-release",
+    "test": "node --test",
+    "validate": "node scripts/validate-package.js"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "consola": "^3.4.2",
+    "plist": "^3.1.1"
+  },
+  "devDependencies": {
+    "@semantic-release/git": "^11.0.1",
+    "semantic-release": "^25.0.9"
+  }
+}

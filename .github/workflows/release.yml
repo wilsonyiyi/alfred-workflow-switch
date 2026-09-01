@@ -1,0 +1,61 @@
+name: CI & Release
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: Test and validate
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version:
+          - 20
+          - 24
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+      - run: npm ci
+      - run: npm run check
+
+  release:
+    name: Release to npm
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: quality
+    runs-on: ubuntu-latest
+    concurrency:
+      group: alfred-workflow-switch-release
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      id-token: write
+      issues: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      - name: Use an OIDC-compatible npm CLI
+        run: npm install --global npm@11
+
+      - run: npm ci
+
+      - name: Analyze commits and publish when required
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: npm run release
