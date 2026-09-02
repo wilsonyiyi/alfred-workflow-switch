@@ -135,7 +135,13 @@ export async function inspectWorkflow({
 
     const normalizedTarget = path.resolve(currentTarget);
     const normalizedSource = path.resolve(sourcePath);
-    const isOwnedLink = normalizedTarget === normalizedSource;
+    const resolvedSourceRoot = path.resolve(sourceRoot);
+    const storedSource = state?.sourcePath ? path.resolve(state.sourcePath) : undefined;
+
+    const isOwnedLink =
+      normalizedTarget === normalizedSource ||
+      normalizedTarget === resolvedSourceRoot ||
+      (storedSource && normalizedTarget === storedSource);
 
     if (isDangling && backupStats && isOwnedLink) {
       return {
@@ -244,7 +250,9 @@ export async function switchToDevelopment(options) {
         throw new Error(`No preserved release exists at ${state.backupPath}`);
       }
 
-      return {...state, changed: false};
+      const result = {...state, changed: false};
+      delete result.lockInfo;
+      return result;
     }
 
     if (state.mode === 'missing') {
@@ -346,7 +354,9 @@ export async function switchToProduction(options) {
     const fileSystem = options.fileSystem ?? fs;
 
     if (state.mode === 'production') {
-      return {...state, changed: false};
+      const result = {...state, changed: false};
+      delete result.lockInfo;
+      return result;
     }
 
     if (state.mode === 'missing') {
@@ -367,6 +377,9 @@ export async function switchToProduction(options) {
       {fileSystem},
     );
 
+    let wasUnlinked = false;
+    let danglingTarget;
+
     if (state.mode === 'development') {
       let currentTarget;
       try {
@@ -383,10 +396,13 @@ export async function switchToProduction(options) {
 
       if (currentTarget) {
         await fileSystem.unlink(state.slotPath);
+        wasUnlinked = true;
       }
     } else if (state.mode === 'development-interrupted') {
       try {
+        danglingTarget = await fileSystem.readlink(state.slotPath);
         await fileSystem.unlink(state.slotPath);
+        wasUnlinked = true;
       } catch (error) {
         if (error.code !== 'ENOENT') {
           throw error;
@@ -397,11 +413,19 @@ export async function switchToProduction(options) {
     try {
       await fileSystem.rename(state.backupPath, state.slotPath);
     } catch (error) {
-      if (state.mode === 'development') {
-        await fileSystem.symlink(state.sourcePath, state.slotPath, 'dir');
+      if (wasUnlinked) {
+        if (state.mode === 'development') {
+          await fileSystem.symlink(state.sourcePath, state.slotPath, 'dir');
+        } else if (state.mode === 'development-interrupted' && danglingTarget) {
+          await fileSystem.symlink(danglingTarget, state.slotPath, 'dir');
+        }
+
         await writeWorkflowState(
           state.statePath,
-          persistedState(state, 'development'),
+          persistedState(
+            state,
+            state.mode === 'development' ? 'development' : 'development-interrupted',
+          ),
           {fileSystem},
         );
       }

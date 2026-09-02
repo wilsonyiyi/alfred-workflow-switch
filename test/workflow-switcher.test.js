@@ -177,3 +177,72 @@ test('recovers from dangling owned link by unlinking first', async t => {
   await switchToDevelopment(options);
   assert.equal(await fs.realpath(options.slotPath), await fs.realpath(options.sourceRoot));
 });
+
+test('recognizes owned dangling links despite path alias mismatch', async t => {
+  const options = await createFixture(t);
+  const development = await switchToDevelopment(options);
+
+  const aliasedSourcePath = development.sourcePath.replace(/^\/var/, '/private/var');
+  const mockFileSystem = {
+    ...fs,
+    realpath: async (target) => {
+      if (target === options.sourceRoot) {
+        return aliasedSourcePath;
+      }
+
+      return fs.realpath(target);
+    },
+  };
+
+  await fs.rm(options.sourceRoot, {recursive: true});
+
+  const state = await inspectWorkflow({...options, fileSystem: mockFileSystem});
+  assert.equal(state.mode, 'development-interrupted');
+  assert.equal(state.releasePreserved, true);
+});
+
+test('restores dangling link when prod restore fails after unlink', async t => {
+  const options = await createFixture(t);
+  const development = await switchToDevelopment(options);
+  await fs.rm(options.sourceRoot, {recursive: true});
+
+  const failingFileSystem = {
+    ...fs,
+    rename: async (source, destination) => {
+      if (source === development.backupPath && destination === options.slotPath) {
+        throw new Error('simulated restore failure');
+      }
+
+      return fs.rename(source, destination);
+    },
+  };
+
+  await assert.rejects(
+    switchToProduction({...options, fileSystem: failingFileSystem}),
+    /simulated restore failure/u,
+  );
+
+  const slotStats = await fs.lstat(options.slotPath);
+  assert.ok(slotStats.isSymbolicLink());
+  assert.equal((await inspectWorkflow(options)).mode, 'development-interrupted');
+});
+
+test('strips lockInfo from idempotent dev and prod operations', async t => {
+  const options = await createFixture(t);
+
+  const firstDev = await switchToDevelopment(options);
+  assert.equal(firstDev.changed, true);
+  assert.equal(firstDev.lockInfo, undefined);
+
+  const secondDev = await switchToDevelopment(options);
+  assert.equal(secondDev.changed, false);
+  assert.equal(secondDev.lockInfo, undefined);
+
+  const firstProd = await switchToProduction(options);
+  assert.equal(firstProd.changed, true);
+  assert.equal(firstProd.lockInfo, undefined);
+
+  const secondProd = await switchToProduction(options);
+  assert.equal(secondProd.changed, false);
+  assert.equal(secondProd.lockInfo, undefined);
+});
