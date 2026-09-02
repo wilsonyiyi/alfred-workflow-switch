@@ -43,23 +43,26 @@ test('acquireOperationLock records the command in owner.json', async t => {
 test('readLockInfo returns lock status and metadata', async t => {
   const sandbox = await createSandbox(t);
   const lockPath = path.join(sandbox, 'operation.lock');
+  const fixedClock = () => 10_000;
 
-  let lockInfo = await readLockInfo({lockPath});
+  let lockInfo = await readLockInfo({clock: fixedClock, lockPath});
   assert.equal(lockInfo.exists, false);
 
-  const release = await acquireOperationLock({command: 'prod', lockPath});
+  const release = await acquireOperationLock({clock: fixedClock, command: 'prod', lockPath});
 
-  lockInfo = await readLockInfo({lockPath});
+  await fs.utimes(lockPath, new Date(10_000), new Date(10_000));
+  lockInfo = await readLockInfo({clock: fixedClock, lockPath});
   assert.equal(lockInfo.exists, true);
   assert.equal(lockInfo.isStale, false);
-  assert.ok(lockInfo.ageMs >= 0);
+  assert.equal(lockInfo.ageMs, 0);
   assert.equal(lockInfo.owner.command, 'prod');
 
   await fs.utimes(lockPath, new Date(0), new Date(0));
   lockInfo = await readLockInfo({clock: () => 50_000, lockPath});
   assert.equal(lockInfo.isStale, true);
+  assert.ok(lockInfo.ageMs > 30_000);
 
   await release();
-  lockInfo = await readLockInfo({lockPath});
+  lockInfo = await readLockInfo({clock: fixedClock, lockPath});
   assert.equal(lockInfo.exists, false);
 });

@@ -133,7 +133,11 @@ export async function inspectWorkflow({
       currentTarget = path.resolve(path.dirname(slotPath), await fileSystem.readlink(slotPath));
     }
 
-    if (isDangling && backupStats) {
+    const normalizedTarget = path.resolve(currentTarget);
+    const normalizedSource = path.resolve(sourcePath);
+    const isOwnedLink = normalizedTarget === normalizedSource;
+
+    if (isDangling && backupStats && isOwnedLink) {
       return {
         ...result,
         currentTarget,
@@ -146,7 +150,7 @@ export async function inspectWorkflow({
     return {
       ...result,
       currentTarget,
-      mode: currentTarget === sourcePath ? 'development' : 'foreign-link',
+      mode: isOwnedLink ? 'development' : 'foreign-link',
       releasePreserved: Boolean(backupStats),
       slotPath,
     };
@@ -251,6 +255,21 @@ export async function switchToDevelopment(options) {
       throw invalidModeError(state);
     }
 
+    let sourceStats;
+    try {
+      sourceStats = await fileSystem.lstat(options.sourceRoot);
+    } catch (error) {
+      if (error.code === 'ENOENT') {
+        throw new Error(`Local source does not exist: ${options.sourceRoot}`);
+      }
+
+      throw error;
+    }
+
+    if (!sourceStats.isDirectory() || sourceStats.isSymbolicLink()) {
+      throw new Error(`Local source is not a directory: ${options.sourceRoot}`);
+    }
+
     await writeWorkflowState(
       state.statePath,
       persistedState(state, 'switching-to-development'),
@@ -259,6 +278,31 @@ export async function switchToDevelopment(options) {
 
     if (state.mode === 'production') {
       await fileSystem.rename(state.slotPath, state.backupPath);
+    } else if (state.mode === 'development-interrupted') {
+      const slotStats = await lstatIfPresent(fileSystem, state.slotPath);
+      if (slotStats?.isSymbolicLink()) {
+        let linkTarget;
+        try {
+          linkTarget = await fileSystem.realpath(state.slotPath);
+        } catch (error) {
+          if (error.code === 'ENOENT') {
+            linkTarget = path.resolve(
+              path.dirname(state.slotPath),
+              await fileSystem.readlink(state.slotPath),
+            );
+          } else {
+            throw error;
+          }
+        }
+
+        const normalizedTarget = path.resolve(linkTarget);
+        const normalizedSource = path.resolve(state.sourcePath);
+        if (normalizedTarget !== normalizedSource) {
+          throw new Error(`Refusing to replace workflow link to ${linkTarget}`);
+        }
+
+        await fileSystem.unlink(state.slotPath);
+      }
     }
 
     try {
@@ -271,6 +315,15 @@ export async function switchToDevelopment(options) {
           persistedState(state, 'production'),
           {fileSystem},
         );
+      } else if (state.mode === 'development-interrupted') {
+        const slotStats = await lstatIfPresent(fileSystem, state.slotPath);
+        if (!slotStats) {
+          try {
+            await fileSystem.symlink(state.sourcePath, state.slotPath, 'dir');
+          } catch {
+            // Best effort rollback of unlink failed
+          }
+        }
       }
 
       throw error;
@@ -281,7 +334,9 @@ export async function switchToDevelopment(options) {
       persistedState(state, 'development'),
       {fileSystem},
     );
-    return {...state, changed: true, mode: 'development', releasePreserved: true};
+    const result = {...state, changed: true, mode: 'development', releasePreserved: true};
+    delete result.lockInfo;
+    return result;
   });
 }
 
@@ -359,6 +414,8 @@ export async function switchToProduction(options) {
       persistedState(state, 'production'),
       {fileSystem},
     );
-    return {...state, changed: true, mode: 'production'};
+    const result = {...state, changed: true, mode: 'production'};
+    delete result.lockInfo;
+    return result;
   });
 }

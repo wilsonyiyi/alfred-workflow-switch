@@ -141,3 +141,39 @@ test('recovers from dangling symlink with prod command', async t => {
   assert.equal(await fs.readFile(path.join(options.slotPath, 'release-marker'), 'utf8'), 'release');
   await assert.rejects(fs.lstat(development.backupPath), {code: 'ENOENT'});
 });
+
+test('refuses to switch when local source does not exist', async t => {
+  const options = await createFixture(t);
+  await fs.rm(options.sourceRoot, {recursive: true});
+
+  await assert.rejects(switchToDevelopment(options), /Local source does not exist/u);
+  assert.equal((await inspectWorkflow(options)).mode, 'production');
+});
+
+test('refuses dangling foreign links even with backup', async t => {
+  const options = await createFixture(t);
+  const foreignRoot = path.join(path.dirname(options.sourceRoot), 'foreign');
+  await writeWorkflow(foreignRoot, options.developmentBundleId);
+
+  await switchToDevelopment(options);
+  await fs.unlink(options.slotPath);
+  await fs.symlink(foreignRoot, options.slotPath, 'dir');
+  await fs.rm(foreignRoot, {recursive: true});
+
+  const state = await inspectWorkflow(options);
+  assert.equal(state.mode, 'foreign-link');
+  await assert.rejects(switchToDevelopment(options), /Refusing to replace workflow link/u);
+  await assert.rejects(switchToProduction(options), /Refusing to replace workflow link/u);
+});
+
+test('recovers from dangling owned link by unlinking first', async t => {
+  const options = await createFixture(t);
+  await switchToDevelopment(options);
+
+  const linkTarget = await fs.readlink(options.slotPath);
+  await fs.rm(options.sourceRoot, {recursive: true});
+  await writeWorkflow(options.sourceRoot, options.developmentBundleId);
+
+  await switchToDevelopment(options);
+  assert.equal(await fs.realpath(options.slotPath), await fs.realpath(options.sourceRoot));
+});

@@ -10,7 +10,7 @@ export async function readLockInfo({clock = Date.now, fileSystem = fs, lockPath}
       fileSystem.readFile(path.join(lockPath, 'owner.json'), 'utf8').catch(() => null),
     ]);
     const owner = ownerData ? JSON.parse(ownerData) : undefined;
-    const ageMs = clock() - stats.mtimeMs;
+    const ageMs = Math.max(0, clock() - stats.mtimeMs);
     return {
       ageMs,
       exists: true,
