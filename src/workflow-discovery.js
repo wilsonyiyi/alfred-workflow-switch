@@ -10,7 +10,7 @@ async function readBundleIdIfPresent(plistPath, fileSystem) {
       return undefined;
     }
 
-    return undefined;
+    throw error;
   }
 }
 

@@ -1,6 +1,6 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import {acquireOperationLock} from './operation-lock.js';
+import {acquireOperationLock, readLockInfo} from './operation-lock.js';
 import {readWorkflowBundleId} from './plist.js';
 import {
   readWorkflowState,
@@ -26,6 +26,36 @@ async function lstatIfPresent(fileSystem, target) {
 
     throw error;
   }
+}
+
+function normalizeDarwinAlias(targetPath) {
+  const normalized = path.resolve(targetPath);
+  if (normalized.startsWith('/private/var/')) {
+    return normalized.replace(/^\/private\/var\//, '/var/');
+  }
+
+  if (normalized.startsWith('/private/tmp/')) {
+    return normalized.replace(/^\/private\/tmp\//, '/tmp/');
+  }
+
+  return normalized;
+}
+
+function isOwnedLink(linkTarget, {sourcePath, sourceRoot, storedSourcePath}) {
+  const target = normalizeDarwinAlias(linkTarget);
+  const current = normalizeDarwinAlias(sourcePath);
+  const root = normalizeDarwinAlias(sourceRoot);
+  const stored = storedSourcePath ? normalizeDarwinAlias(storedSourcePath) : undefined;
+
+  return target === current || target === root || (stored && target === stored);
+}
+
+function isCurrentSource(linkTarget, {sourcePath, sourceRoot}) {
+  const target = normalizeDarwinAlias(linkTarget);
+  const current = normalizeDarwinAlias(sourcePath);
+  const root = normalizeDarwinAlias(sourceRoot);
+
+  return target === current || target === root;
 }
 
 function assertBackup(stats, backupPath) {
@@ -61,12 +91,25 @@ export async function inspectWorkflow({
     sourceRoot,
   };
   const paths = workflowStatePaths({preferencesRoot, releaseBundleId});
-  const [sourcePath, state, releaseSlots] = await Promise.all([
-    fileSystem.realpath(sourceRoot),
+
+  let sourcePath;
+  try {
+    sourcePath = await fileSystem.realpath(sourceRoot);
+  } catch (error) {
+    if (error.code === 'ENOENT') {
+      sourcePath = path.resolve(sourceRoot);
+    } else {
+      throw error;
+    }
+  }
+
+  const [state, releaseSlots, lockInfo] = await Promise.all([
     readWorkflowState(paths.statePath, {fileSystem}),
     findWorkflowSlotsByBundleId({bundleId: releaseBundleId, fileSystem, preferencesRoot}),
+    readLockInfo({fileSystem, lockPath: paths.lockPath}),
   ]);
   const result = baseResult(options, paths, sourcePath, state);
+  result.lockInfo = lockInfo;
 
   if (releaseSlots.length > 1) {
     return {...result, mode: 'multiple-releases', releaseSlots};
@@ -108,6 +151,7 @@ export async function inspectWorkflow({
 
   if (slotStats.isSymbolicLink()) {
     let currentTarget;
+    let isDangling = false;
     try {
       currentTarget = await fileSystem.realpath(slotPath);
     } catch (error) {
@@ -115,13 +159,42 @@ export async function inspectWorkflow({
         throw error;
       }
 
+      isDangling = true;
       currentTarget = path.resolve(path.dirname(slotPath), await fileSystem.readlink(slotPath));
     }
+
+    const owned = isOwnedLink(currentTarget, {
+      sourcePath,
+      sourceRoot,
+      storedSourcePath: state?.sourcePath,
+    });
+
+    if (!owned) {
+      return {
+        ...result,
+        currentTarget,
+        mode: 'foreign-link',
+        releasePreserved: Boolean(backupStats),
+        slotPath,
+      };
+    }
+
+    if (isDangling && backupStats) {
+      return {
+        ...result,
+        currentTarget,
+        mode: 'development-interrupted',
+        releasePreserved: true,
+        slotPath,
+      };
+    }
+
+    const isCurrent = isCurrentSource(currentTarget, {sourcePath, sourceRoot});
 
     return {
       ...result,
       currentTarget,
-      mode: currentTarget === sourcePath ? 'development' : 'foreign-link',
+      mode: isCurrent ? 'development' : 'development-interrupted',
       releasePreserved: Boolean(backupStats),
       slotPath,
     };
@@ -191,9 +264,10 @@ function persistedState(state, status) {
   };
 }
 
-async function withOperationLock(options, operation) {
+async function withOperationLock(options, command, operation) {
   const paths = workflowStatePaths(options);
   const release = await acquireOperationLock({
+    command,
     fileSystem: options.fileSystem ?? fs,
     lockPath: paths.lockPath,
   });
@@ -205,7 +279,7 @@ async function withOperationLock(options, operation) {
 }
 
 export async function switchToDevelopment(options) {
-  return withOperationLock(options, async () => {
+  return withOperationLock(options, 'dev', async () => {
     const state = await inspectWorkflow(options);
     const fileSystem = options.fileSystem ?? fs;
 
@@ -214,7 +288,9 @@ export async function switchToDevelopment(options) {
         throw new Error(`No preserved release exists at ${state.backupPath}`);
       }
 
-      return {...state, changed: false};
+      const result = {...state, changed: false};
+      delete result.lockInfo;
+      return result;
     }
 
     if (state.mode === 'missing') {
@@ -225,14 +301,63 @@ export async function switchToDevelopment(options) {
       throw invalidModeError(state);
     }
 
+    let sourceStats;
+    try {
+      sourceStats = await fileSystem.lstat(options.sourceRoot);
+    } catch (error) {
+      if (error.code === 'ENOENT') {
+        throw new Error(`Local source does not exist: ${options.sourceRoot}`);
+      }
+
+      throw error;
+    }
+
+    if (!sourceStats.isDirectory() || sourceStats.isSymbolicLink()) {
+      throw new Error(`Local source is not a directory: ${options.sourceRoot}`);
+    }
+
     await writeWorkflowState(
       state.statePath,
       persistedState(state, 'switching-to-development'),
       {fileSystem},
     );
 
+    let originalLinkTarget;
+    let originalStoredSourcePath;
+    let wasUnlinked = false;
+
     if (state.mode === 'production') {
       await fileSystem.rename(state.slotPath, state.backupPath);
+    } else if (state.mode === 'development-interrupted') {
+      const slotStats = await lstatIfPresent(fileSystem, state.slotPath);
+      if (slotStats?.isSymbolicLink()) {
+        originalLinkTarget = await fileSystem.readlink(state.slotPath);
+        originalStoredSourcePath = state.storedState?.sourcePath;
+
+        let linkTarget;
+        try {
+          linkTarget = await fileSystem.realpath(state.slotPath);
+        } catch (error) {
+          if (error.code === 'ENOENT') {
+            linkTarget = path.resolve(path.dirname(state.slotPath), originalLinkTarget);
+          } else {
+            throw error;
+          }
+        }
+
+        const owned = isOwnedLink(linkTarget, {
+          sourcePath: state.sourcePath,
+          sourceRoot: options.sourceRoot,
+          storedSourcePath: state.storedState?.sourcePath,
+        });
+
+        if (!owned) {
+          throw new Error(`Refusing to replace workflow link to ${linkTarget}`);
+        }
+
+        await fileSystem.unlink(state.slotPath);
+        wasUnlinked = true;
+      }
     }
 
     try {
@@ -245,6 +370,23 @@ export async function switchToDevelopment(options) {
           persistedState(state, 'production'),
           {fileSystem},
         );
+      } else if (state.mode === 'development-interrupted' && wasUnlinked) {
+        try {
+          await fileSystem.symlink(originalLinkTarget, state.slotPath, 'dir');
+          const rollbackState = {
+            ...state,
+            sourcePath: originalStoredSourcePath || state.storedState?.sourcePath || state.sourcePath,
+          };
+          await writeWorkflowState(
+            state.statePath,
+            persistedState(rollbackState, 'development-interrupted'),
+            {fileSystem},
+          );
+        } catch (rollbackError) {
+          throw new Error(
+            `Failed to create new link and restore original: ${error.message}; rollback: ${rollbackError.message}`,
+          );
+        }
       }
 
       throw error;
@@ -255,17 +397,21 @@ export async function switchToDevelopment(options) {
       persistedState(state, 'development'),
       {fileSystem},
     );
-    return {...state, changed: true, mode: 'development', releasePreserved: true};
+    const result = {...state, changed: true, mode: 'development', releasePreserved: true};
+    delete result.lockInfo;
+    return result;
   });
 }
 
 export async function switchToProduction(options) {
-  return withOperationLock(options, async () => {
+  return withOperationLock(options, 'prod', async () => {
     const state = await inspectWorkflow(options);
     const fileSystem = options.fileSystem ?? fs;
 
     if (state.mode === 'production') {
-      return {...state, changed: false};
+      const result = {...state, changed: false};
+      delete result.lockInfo;
+      return result;
     }
 
     if (state.mode === 'missing') {
@@ -286,23 +432,68 @@ export async function switchToProduction(options) {
       {fileSystem},
     );
 
+    let wasUnlinked = false;
+    let danglingTarget;
+    let originalStoredSourcePath;
+
     if (state.mode === 'development') {
-      const currentTarget = await fileSystem.realpath(state.slotPath);
-      if (currentTarget !== state.sourcePath) {
-        throw new Error(`Refusing to remove workflow link to ${currentTarget}`);
+      let currentTarget;
+      try {
+        currentTarget = await fileSystem.realpath(state.slotPath);
+      } catch (error) {
+        if (error.code !== 'ENOENT') {
+          throw error;
+        }
       }
 
-      await fileSystem.unlink(state.slotPath);
+      if (currentTarget) {
+        const owned = isOwnedLink(currentTarget, {
+          sourcePath: state.sourcePath,
+          sourceRoot: options.sourceRoot,
+          storedSourcePath: state.storedState?.sourcePath,
+        });
+
+        if (!owned) {
+          throw new Error(`Refusing to remove workflow link to ${currentTarget}`);
+        }
+
+        await fileSystem.unlink(state.slotPath);
+        wasUnlinked = true;
+      }
+    } else if (state.mode === 'development-interrupted') {
+      try {
+        danglingTarget = await fileSystem.readlink(state.slotPath);
+        originalStoredSourcePath = state.storedState?.sourcePath || danglingTarget;
+        await fileSystem.unlink(state.slotPath);
+        wasUnlinked = true;
+      } catch (error) {
+        if (error.code !== 'ENOENT') {
+          throw error;
+        }
+      }
     }
 
     try {
       await fileSystem.rename(state.backupPath, state.slotPath);
     } catch (error) {
-      if (state.mode === 'development') {
-        await fileSystem.symlink(state.sourcePath, state.slotPath, 'dir');
+      if (wasUnlinked) {
+        if (state.mode === 'development') {
+          await fileSystem.symlink(state.sourcePath, state.slotPath, 'dir');
+        } else if (state.mode === 'development-interrupted' && danglingTarget) {
+          await fileSystem.symlink(danglingTarget, state.slotPath, 'dir');
+        }
+
+        const rollbackState = {
+          ...state,
+          sourcePath: originalStoredSourcePath || state.storedState?.sourcePath || state.sourcePath,
+        };
+
         await writeWorkflowState(
           state.statePath,
-          persistedState(state, 'development'),
+          persistedState(
+            rollbackState,
+            state.mode === 'development' ? 'development' : 'development-interrupted',
+          ),
           {fileSystem},
         );
       }
@@ -315,6 +506,8 @@ export async function switchToProduction(options) {
       persistedState(state, 'production'),
       {fileSystem},
     );
-    return {...state, changed: true, mode: 'production'};
+    const result = {...state, changed: true, mode: 'production'};
+    delete result.lockInfo;
+    return result;
   });
 }

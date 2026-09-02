@@ -29,3 +29,17 @@ test('assertWorkflowSlotPath rejects paths outside the workflows directory', () 
     /outside the Alfred workflows directory/u,
   );
 });
+
+test('findWorkflowSlotsByBundleId throws on plist parse errors', async t => {
+  const preferencesRoot = await createSandbox(t);
+  const workflowsRoot = path.join(preferencesRoot, 'workflows');
+  const slotPath = path.join(workflowsRoot, 'user.workflow.bad');
+  await writeWorkflow(slotPath, 'com.example.workflow');
+
+  const {default: fs} = await import('node:fs/promises');
+  await fs.writeFile(path.join(slotPath, 'info.plist'), 'invalid plist content', 'utf8');
+
+  await assert.rejects(
+    findWorkflowSlotsByBundleId({bundleId: 'com.example.workflow', preferencesRoot}),
+  );
+});
