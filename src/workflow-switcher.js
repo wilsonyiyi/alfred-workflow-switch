@@ -28,6 +28,19 @@ async function lstatIfPresent(fileSystem, target) {
   }
 }
 
+function isOwnedLink(linkTarget, {sourcePath, sourceRoot, storedSourcePath}) {
+  const normalizedTarget = path.resolve(linkTarget);
+  const normalizedSource = path.resolve(sourcePath);
+  const resolvedSourceRoot = path.resolve(sourceRoot);
+  const normalizedStored = storedSourcePath ? path.resolve(storedSourcePath) : undefined;
+
+  return (
+    normalizedTarget === normalizedSource ||
+    normalizedTarget === resolvedSourceRoot ||
+    (normalizedStored && normalizedTarget === normalizedStored)
+  );
+}
+
 function assertBackup(stats, backupPath) {
   if (stats && (!stats.isDirectory() || stats.isSymbolicLink())) {
     throw new Error(`Release backup is not a directory: ${backupPath}`);
@@ -133,17 +146,13 @@ export async function inspectWorkflow({
       currentTarget = path.resolve(path.dirname(slotPath), await fileSystem.readlink(slotPath));
     }
 
-    const normalizedTarget = path.resolve(currentTarget);
-    const normalizedSource = path.resolve(sourcePath);
-    const resolvedSourceRoot = path.resolve(sourceRoot);
-    const storedSource = state?.sourcePath ? path.resolve(state.sourcePath) : undefined;
+    const owned = isOwnedLink(currentTarget, {
+      sourcePath,
+      sourceRoot,
+      storedSourcePath: state?.sourcePath,
+    });
 
-    const isOwnedLink =
-      normalizedTarget === normalizedSource ||
-      normalizedTarget === resolvedSourceRoot ||
-      (storedSource && normalizedTarget === storedSource);
-
-    if (isDangling && backupStats && isOwnedLink) {
+    if (isDangling && backupStats && owned) {
       return {
         ...result,
         currentTarget,
@@ -156,7 +165,7 @@ export async function inspectWorkflow({
     return {
       ...result,
       currentTarget,
-      mode: isOwnedLink ? 'development' : 'foreign-link',
+      mode: owned ? 'development' : 'foreign-link',
       releasePreserved: Boolean(backupStats),
       slotPath,
     };
@@ -303,9 +312,13 @@ export async function switchToDevelopment(options) {
           }
         }
 
-        const normalizedTarget = path.resolve(linkTarget);
-        const normalizedSource = path.resolve(state.sourcePath);
-        if (normalizedTarget !== normalizedSource) {
+        const owned = isOwnedLink(linkTarget, {
+          sourcePath: state.sourcePath,
+          sourceRoot: options.sourceRoot,
+          storedSourcePath: state.storedState?.sourcePath,
+        });
+
+        if (!owned) {
           throw new Error(`Refusing to replace workflow link to ${linkTarget}`);
         }
 
@@ -379,6 +392,7 @@ export async function switchToProduction(options) {
 
     let wasUnlinked = false;
     let danglingTarget;
+    let originalStoredSourcePath;
 
     if (state.mode === 'development') {
       let currentTarget;
@@ -390,17 +404,24 @@ export async function switchToProduction(options) {
         }
       }
 
-      if (currentTarget && currentTarget !== state.sourcePath) {
-        throw new Error(`Refusing to remove workflow link to ${currentTarget}`);
-      }
-
       if (currentTarget) {
+        const owned = isOwnedLink(currentTarget, {
+          sourcePath: state.sourcePath,
+          sourceRoot: options.sourceRoot,
+          storedSourcePath: state.storedState?.sourcePath,
+        });
+
+        if (!owned) {
+          throw new Error(`Refusing to remove workflow link to ${currentTarget}`);
+        }
+
         await fileSystem.unlink(state.slotPath);
         wasUnlinked = true;
       }
     } else if (state.mode === 'development-interrupted') {
       try {
         danglingTarget = await fileSystem.readlink(state.slotPath);
+        originalStoredSourcePath = state.storedState?.sourcePath || danglingTarget;
         await fileSystem.unlink(state.slotPath);
         wasUnlinked = true;
       } catch (error) {
@@ -420,10 +441,15 @@ export async function switchToProduction(options) {
           await fileSystem.symlink(danglingTarget, state.slotPath, 'dir');
         }
 
+        const rollbackState = {
+          ...state,
+          sourcePath: originalStoredSourcePath || state.storedState?.sourcePath || state.sourcePath,
+        };
+
         await writeWorkflowState(
           state.statePath,
           persistedState(
-            state,
+            rollbackState,
             state.mode === 'development' ? 'development' : 'development-interrupted',
           ),
           {fileSystem},

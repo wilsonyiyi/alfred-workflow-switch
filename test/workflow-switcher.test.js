@@ -227,6 +227,55 @@ test('restores dangling link when prod restore fails after unlink', async t => {
   assert.equal((await inspectWorkflow(options)).mode, 'development-interrupted');
 });
 
+test('rollback preserves canonical stored source despite path alias', async t => {
+  const options = await createFixture(t);
+  const development = await switchToDevelopment(options);
+
+  const aliasedSourcePath = development.sourcePath.replace(/^\/var/, '/private/var');
+  const failingFileSystem = {
+    ...fs,
+    realpath: async (target) => {
+      if (target === options.sourceRoot) {
+        return '/var/tmp/nonexistent';
+      }
+
+      return fs.realpath(target);
+    },
+    rename: async (source, destination) => {
+      if (source === development.backupPath && destination === options.slotPath) {
+        throw new Error('simulated restore failure');
+      }
+
+      return fs.rename(source, destination);
+    },
+  };
+
+  await fs.rm(options.sourceRoot, {recursive: true});
+
+  await assert.rejects(
+    switchToProduction({...options, fileSystem: failingFileSystem}),
+    /simulated restore failure/u,
+  );
+
+  const state = await inspectWorkflow(options);
+  assert.equal(state.mode, 'development-interrupted');
+});
+
+test('switches from source A to source B during interrupted recovery', async t => {
+  const options = await createFixture(t);
+  await switchToDevelopment(options);
+
+  const sourceB = path.join(path.dirname(options.sourceRoot), 'source-b');
+  await writeWorkflow(sourceB, options.developmentBundleId);
+  await fs.rm(options.sourceRoot, {recursive: true});
+
+  const state = await inspectWorkflow(options);
+  assert.equal(state.mode, 'development-interrupted');
+
+  await switchToDevelopment({...options, sourceRoot: sourceB});
+  assert.equal(await fs.realpath(options.slotPath), await fs.realpath(sourceB));
+});
+
 test('strips lockInfo from idempotent dev and prod operations', async t => {
   const options = await createFixture(t);
 
