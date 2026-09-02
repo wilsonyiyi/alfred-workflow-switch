@@ -1,6 +1,6 @@
 {
   "name": "alfred-workflow-switch",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Safely switch one Alfred workflow slot between an installed release and local source",
   "type": "module",
   "license": "MIT",
