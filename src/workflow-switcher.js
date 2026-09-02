@@ -1,6 +1,6 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import {acquireOperationLock} from './operation-lock.js';
+import {acquireOperationLock, readLockInfo} from './operation-lock.js';
 import {readWorkflowBundleId} from './plist.js';
 import {
   readWorkflowState,
@@ -61,12 +61,25 @@ export async function inspectWorkflow({
     sourceRoot,
   };
   const paths = workflowStatePaths({preferencesRoot, releaseBundleId});
-  const [sourcePath, state, releaseSlots] = await Promise.all([
-    fileSystem.realpath(sourceRoot),
+
+  let sourcePath;
+  try {
+    sourcePath = await fileSystem.realpath(sourceRoot);
+  } catch (error) {
+    if (error.code === 'ENOENT') {
+      sourcePath = path.resolve(sourceRoot);
+    } else {
+      throw error;
+    }
+  }
+
+  const [state, releaseSlots, lockInfo] = await Promise.all([
     readWorkflowState(paths.statePath, {fileSystem}),
     findWorkflowSlotsByBundleId({bundleId: releaseBundleId, fileSystem, preferencesRoot}),
+    readLockInfo({fileSystem, lockPath: paths.lockPath}),
   ]);
   const result = baseResult(options, paths, sourcePath, state);
+  result.lockInfo = lockInfo;
 
   if (releaseSlots.length > 1) {
     return {...result, mode: 'multiple-releases', releaseSlots};
@@ -108,6 +121,7 @@ export async function inspectWorkflow({
 
   if (slotStats.isSymbolicLink()) {
     let currentTarget;
+    let isDangling = false;
     try {
       currentTarget = await fileSystem.realpath(slotPath);
     } catch (error) {
@@ -115,7 +129,18 @@ export async function inspectWorkflow({
         throw error;
       }
 
+      isDangling = true;
       currentTarget = path.resolve(path.dirname(slotPath), await fileSystem.readlink(slotPath));
+    }
+
+    if (isDangling && backupStats) {
+      return {
+        ...result,
+        currentTarget,
+        mode: 'development-interrupted',
+        releasePreserved: true,
+        slotPath,
+      };
     }
 
     return {
@@ -191,9 +216,10 @@ function persistedState(state, status) {
   };
 }
 
-async function withOperationLock(options, operation) {
+async function withOperationLock(options, command, operation) {
   const paths = workflowStatePaths(options);
   const release = await acquireOperationLock({
+    command,
     fileSystem: options.fileSystem ?? fs,
     lockPath: paths.lockPath,
   });
@@ -205,7 +231,7 @@ async function withOperationLock(options, operation) {
 }
 
 export async function switchToDevelopment(options) {
-  return withOperationLock(options, async () => {
+  return withOperationLock(options, 'dev', async () => {
     const state = await inspectWorkflow(options);
     const fileSystem = options.fileSystem ?? fs;
 
@@ -260,7 +286,7 @@ export async function switchToDevelopment(options) {
 }
 
 export async function switchToProduction(options) {
-  return withOperationLock(options, async () => {
+  return withOperationLock(options, 'prod', async () => {
     const state = await inspectWorkflow(options);
     const fileSystem = options.fileSystem ?? fs;
 
@@ -287,12 +313,30 @@ export async function switchToProduction(options) {
     );
 
     if (state.mode === 'development') {
-      const currentTarget = await fileSystem.realpath(state.slotPath);
-      if (currentTarget !== state.sourcePath) {
+      let currentTarget;
+      try {
+        currentTarget = await fileSystem.realpath(state.slotPath);
+      } catch (error) {
+        if (error.code !== 'ENOENT') {
+          throw error;
+        }
+      }
+
+      if (currentTarget && currentTarget !== state.sourcePath) {
         throw new Error(`Refusing to remove workflow link to ${currentTarget}`);
       }
 
-      await fileSystem.unlink(state.slotPath);
+      if (currentTarget) {
+        await fileSystem.unlink(state.slotPath);
+      }
+    } else if (state.mode === 'development-interrupted') {
+      try {
+        await fileSystem.unlink(state.slotPath);
+      } catch (error) {
+        if (error.code !== 'ENOENT') {
+          throw error;
+        }
+      }
     }
 
     try {

@@ -118,3 +118,26 @@ test('restores the development link when restoring the release fails', async t =
   assert.equal(await fs.realpath(options.slotPath), await fs.realpath(options.sourceRoot));
   assert.equal((await inspectWorkflow(options)).mode, 'development');
 });
+
+test('treats a dangling symlink as development-interrupted when backup exists', async t => {
+  const options = await createFixture(t);
+  await switchToDevelopment(options);
+
+  const linkTarget = await fs.readlink(options.slotPath);
+  await fs.rm(options.sourceRoot, {recursive: true});
+
+  const state = await inspectWorkflow(options);
+  assert.equal(state.mode, 'development-interrupted');
+  assert.equal(state.releasePreserved, true);
+  assert.ok(state.currentTarget.includes(linkTarget) || linkTarget.includes(path.basename(state.currentTarget)));
+});
+
+test('recovers from dangling symlink with prod command', async t => {
+  const options = await createFixture(t);
+  const development = await switchToDevelopment(options);
+  await fs.rm(options.sourceRoot, {recursive: true});
+
+  await switchToProduction(options);
+  assert.equal(await fs.readFile(path.join(options.slotPath, 'release-marker'), 'utf8'), 'release');
+  await assert.rejects(fs.lstat(development.backupPath), {code: 'ENOENT'});
+});

@@ -15,6 +15,19 @@ function usage() {
 }
 
 export function parseCliArguments(argv) {
+  if (argv.length === 0) {
+    throw new Error(usage());
+  }
+
+  const firstArg = argv[0];
+  if (firstArg === '--help' || firstArg === '-h') {
+    return {command: 'help'};
+  }
+
+  if (firstArg === '--version' || firstArg === '-v') {
+    return {command: 'version'};
+  }
+
   const [command, ...tokens] = argv;
   if (!COMMANDS.has(command)) {
     throw new Error(usage());
@@ -55,12 +68,41 @@ function printDoctor(result, logger) {
   logger.info(`Mode: ${paint.mode(result.mode)}`);
   logger.info(`Release bundle ID: ${paint.value(result.releaseBundleId)}`);
   logger.info(`Development bundle ID: ${paint.value(result.developmentBundleId)}`);
+
+  if (result.developmentBundleId === result.releaseBundleId) {
+    logger.warn(
+      'Development and release bundle IDs are identical. The dev symlink may appear as a release candidate when state is missing.',
+    );
+  }
+
   logger.info(`Preferences: ${paint.path(result.preferencesRoot)}`);
   logger.info(`Source: ${paint.path(result.sourcePath)}`);
   logger.info(`Workflow slot: ${paint.path(result.slotPath ?? 'not found')}`);
   logger.info(`Release backup: ${paint.path(result.backupPath)}`);
+
+  if (result.lockInfo?.exists) {
+    const {owner, isStale, ageMs} = result.lockInfo;
+    const staleNote = isStale ? ' (stale)' : '';
+    logger.info(
+      `Operation lock: exists${staleNote} (age: ${Math.round(ageMs)}ms, pid: ${owner?.pid ?? 'unknown'}, command: ${owner?.command ?? 'unknown'})`,
+    );
+  } else {
+    logger.info('Operation lock: none');
+  }
+
   if (result.reason) {
     logger.warn(`Reason: ${result.reason}`);
+  }
+
+  if (result.mode === 'conflict') {
+    logger.warn('Recovery: both slot and backup exist. To recover:');
+    logger.warn(`  1. Inspect both: ${paint.path(result.slotPath)} and ${paint.path(result.backupPath)}`);
+    logger.warn('  2. Keep the desired workflow and remove the other');
+    logger.warn('  3. Run dev or prod to re-establish the switch');
+  }
+
+  if (result.mode === 'development-interrupted') {
+    logger.info('Recovery: run "dev" to restore the development link or "prod" to restore the release');
   }
 }
 
@@ -70,8 +112,24 @@ export async function runCli({
   homeDirectory = os.homedir(),
   logger = defaultLogger,
   output = console.log,
+  packageJson,
 } = {}) {
   const cli = parseCliArguments(argv);
+
+  if (cli.command === 'help') {
+    output(usage());
+    return;
+  }
+
+  if (cli.command === 'version') {
+    if (!packageJson) {
+      throw new Error('Package metadata is required for --version');
+    }
+
+    output(packageJson.version);
+    return;
+  }
+
   const config = await readProjectConfig({projectRoot: cli.projectRoot});
   const preferencesRoot = await resolveAlfredPreferences({environment, homeDirectory});
   const options = {...config, preferencesRoot};
