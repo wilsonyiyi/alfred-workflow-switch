@@ -28,17 +28,34 @@ async function lstatIfPresent(fileSystem, target) {
   }
 }
 
-function isOwnedLink(linkTarget, {sourcePath, sourceRoot, storedSourcePath}) {
-  const normalizedTarget = path.resolve(linkTarget);
-  const normalizedSource = path.resolve(sourcePath);
-  const resolvedSourceRoot = path.resolve(sourceRoot);
-  const normalizedStored = storedSourcePath ? path.resolve(storedSourcePath) : undefined;
+function normalizeDarwinAlias(targetPath) {
+  const normalized = path.resolve(targetPath);
+  if (normalized.startsWith('/private/var/')) {
+    return normalized.replace(/^\/private\/var\//, '/var/');
+  }
 
-  return (
-    normalizedTarget === normalizedSource ||
-    normalizedTarget === resolvedSourceRoot ||
-    (normalizedStored && normalizedTarget === normalizedStored)
-  );
+  if (normalized.startsWith('/private/tmp/')) {
+    return normalized.replace(/^\/private\/tmp\//, '/tmp/');
+  }
+
+  return normalized;
+}
+
+function isOwnedLink(linkTarget, {sourcePath, sourceRoot, storedSourcePath}) {
+  const target = normalizeDarwinAlias(linkTarget);
+  const current = normalizeDarwinAlias(sourcePath);
+  const root = normalizeDarwinAlias(sourceRoot);
+  const stored = storedSourcePath ? normalizeDarwinAlias(storedSourcePath) : undefined;
+
+  return target === current || target === root || (stored && target === stored);
+}
+
+function isCurrentSource(linkTarget, {sourcePath, sourceRoot}) {
+  const target = normalizeDarwinAlias(linkTarget);
+  const current = normalizeDarwinAlias(sourcePath);
+  const root = normalizeDarwinAlias(sourceRoot);
+
+  return target === current || target === root;
 }
 
 function assertBackup(stats, backupPath) {
@@ -152,7 +169,17 @@ export async function inspectWorkflow({
       storedSourcePath: state?.sourcePath,
     });
 
-    if (isDangling && backupStats && owned) {
+    if (!owned) {
+      return {
+        ...result,
+        currentTarget,
+        mode: 'foreign-link',
+        releasePreserved: Boolean(backupStats),
+        slotPath,
+      };
+    }
+
+    if (isDangling && backupStats) {
       return {
         ...result,
         currentTarget,
@@ -162,10 +189,12 @@ export async function inspectWorkflow({
       };
     }
 
+    const isCurrent = isCurrentSource(currentTarget, {sourcePath, sourceRoot});
+
     return {
       ...result,
       currentTarget,
-      mode: owned ? 'development' : 'foreign-link',
+      mode: isCurrent ? 'development' : 'development-interrupted',
       releasePreserved: Boolean(backupStats),
       slotPath,
     };
@@ -293,20 +322,24 @@ export async function switchToDevelopment(options) {
       {fileSystem},
     );
 
+    let originalLinkTarget;
+    let originalStoredSourcePath;
+    let wasUnlinked = false;
+
     if (state.mode === 'production') {
       await fileSystem.rename(state.slotPath, state.backupPath);
     } else if (state.mode === 'development-interrupted') {
       const slotStats = await lstatIfPresent(fileSystem, state.slotPath);
       if (slotStats?.isSymbolicLink()) {
+        originalLinkTarget = await fileSystem.readlink(state.slotPath);
+        originalStoredSourcePath = state.storedState?.sourcePath;
+
         let linkTarget;
         try {
           linkTarget = await fileSystem.realpath(state.slotPath);
         } catch (error) {
           if (error.code === 'ENOENT') {
-            linkTarget = path.resolve(
-              path.dirname(state.slotPath),
-              await fileSystem.readlink(state.slotPath),
-            );
+            linkTarget = path.resolve(path.dirname(state.slotPath), originalLinkTarget);
           } else {
             throw error;
           }
@@ -323,6 +356,7 @@ export async function switchToDevelopment(options) {
         }
 
         await fileSystem.unlink(state.slotPath);
+        wasUnlinked = true;
       }
     }
 
@@ -336,14 +370,22 @@ export async function switchToDevelopment(options) {
           persistedState(state, 'production'),
           {fileSystem},
         );
-      } else if (state.mode === 'development-interrupted') {
-        const slotStats = await lstatIfPresent(fileSystem, state.slotPath);
-        if (!slotStats) {
-          try {
-            await fileSystem.symlink(state.sourcePath, state.slotPath, 'dir');
-          } catch {
-            // Best effort rollback of unlink failed
-          }
+      } else if (state.mode === 'development-interrupted' && wasUnlinked) {
+        try {
+          await fileSystem.symlink(originalLinkTarget, state.slotPath, 'dir');
+          const rollbackState = {
+            ...state,
+            sourcePath: originalStoredSourcePath || state.storedState?.sourcePath || state.sourcePath,
+          };
+          await writeWorkflowState(
+            state.statePath,
+            persistedState(rollbackState, 'development-interrupted'),
+            {fileSystem},
+          );
+        } catch (rollbackError) {
+          throw new Error(
+            `Failed to create new link and restore original: ${error.message}; rollback: ${rollbackError.message}`,
+          );
         }
       }
 

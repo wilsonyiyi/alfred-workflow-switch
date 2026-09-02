@@ -295,3 +295,175 @@ test('strips lockInfo from idempotent dev and prod operations', async t => {
   assert.equal(secondProd.changed, false);
   assert.equal(secondProd.lockInfo, undefined);
 });
+
+test('[A] A and B both exist, slot linked to A, dev from B relinks', async t => {
+  const options = await createFixture(t);
+  await switchToDevelopment(options);
+
+  const sourceB = path.join(path.dirname(options.sourceRoot), 'source-b');
+  await writeWorkflow(sourceB, options.developmentBundleId);
+
+  const result = await switchToDevelopment({...options, sourceRoot: sourceB});
+  assert.equal(result.changed, true);
+  assert.equal(await fs.realpath(options.slotPath), await fs.realpath(sourceB));
+});
+
+test('[B] A deleted (dangling), dev from B succeeds', async t => {
+  const options = await createFixture(t);
+  await switchToDevelopment(options);
+  await fs.rm(options.sourceRoot, {recursive: true});
+
+  const sourceB = path.join(path.dirname(options.sourceRoot), 'source-b');
+  await writeWorkflow(sourceB, options.developmentBundleId);
+
+  const result = await switchToDevelopment({...options, sourceRoot: sourceB});
+  assert.equal(result.changed, true);
+  assert.equal(await fs.realpath(options.slotPath), await fs.realpath(sourceB));
+});
+
+test('[C] A dangling, symlink-to-B failure restores A link and sourcePath', async t => {
+  const options = await createFixture(t);
+  const devA = await switchToDevelopment(options);
+  const originalLinkTarget = await fs.readlink(options.slotPath);
+  await fs.rm(options.sourceRoot, {recursive: true});
+
+  const sourceB = path.join(path.dirname(options.sourceRoot), 'source-b');
+  await writeWorkflow(sourceB, options.developmentBundleId);
+
+  let symlinkAttempts = 0;
+  const failingFileSystem = {
+    ...fs,
+    symlink: async (target, linkPath, type) => {
+      if (linkPath === options.slotPath) {
+        symlinkAttempts += 1;
+        if (symlinkAttempts === 1 && target.includes('source-b')) {
+          throw new Error('simulated symlink failure');
+        }
+      }
+
+      return fs.symlink(target, linkPath, type);
+    },
+  };
+
+  await assert.rejects(
+    switchToDevelopment({...options, sourceRoot: sourceB, fileSystem: failingFileSystem}),
+    /simulated symlink failure/u,
+  );
+
+  const slotLink = await fs.readlink(options.slotPath);
+  assert.equal(slotLink, originalLinkTarget);
+
+  const state = await inspectWorkflow(options);
+  assert.equal(state.mode, 'development-interrupted');
+  assert.equal(state.storedState.sourcePath, devA.sourcePath);
+  assert.notEqual(state.storedState.status, 'switching-to-development');
+});
+
+test('[D] Darwin alias: /var vs /private/var treated as owned', async t => {
+  const options = await createFixture(t);
+  const devResult = await switchToDevelopment(options);
+
+  const mockFileSystem = {
+    ...fs,
+    realpath: async (target) => {
+      if (target === options.sourceRoot) {
+        return devResult.sourcePath.replace(/^\/var\//, '/private/var/');
+      }
+
+      return fs.realpath(target);
+    },
+  };
+
+  await fs.rm(options.sourceRoot, {recursive: true});
+
+  const state = await inspectWorkflow({...options, fileSystem: mockFileSystem});
+  assert.equal(state.mode, 'development-interrupted');
+
+  const failingProdFS = {
+    ...mockFileSystem,
+    rename: async () => {
+      throw new Error('simulated restore failure');
+    },
+  };
+
+  await assert.rejects(switchToProduction({...options, fileSystem: failingProdFS}));
+
+  const afterRollback = await inspectWorkflow(options);
+  assert.equal(afterRollback.mode, 'development-interrupted');
+  assert.ok(afterRollback.storedState.sourcePath.includes('private') || afterRollback.storedState.sourcePath.includes(path.basename(devResult.sourcePath)));
+});
+
+test('[E] Foreign dangling target + backup: inspect foreign-link, prod throws', async t => {
+  const options = await createFixture(t);
+  await switchToDevelopment(options);
+
+  const foreignRoot = path.join(path.dirname(options.sourceRoot), 'foreign');
+  await writeWorkflow(foreignRoot, options.developmentBundleId);
+  await fs.unlink(options.slotPath);
+  await fs.symlink(foreignRoot, options.slotPath, 'dir');
+  await fs.rm(foreignRoot, {recursive: true});
+
+  const state = await inspectWorkflow(options);
+  assert.equal(state.mode, 'foreign-link');
+
+  const slotBefore = await fs.readlink(options.slotPath);
+  await assert.rejects(switchToProduction(options), /Refusing to replace/u);
+  const slotAfter = await fs.readlink(options.slotPath);
+  assert.equal(slotBefore, slotAfter);
+});
+
+test('[F] Missing sourceRoot: dev throws before renaming production slot', async t => {
+  const options = await createFixture(t);
+  const missingSource = path.join(path.dirname(options.sourceRoot), 'nonexistent');
+
+  await assert.rejects(
+    switchToDevelopment({...options, sourceRoot: missingSource}),
+    /Local source does not exist/u,
+  );
+
+  assert.equal((await inspectWorkflow(options)).mode, 'production');
+  assert.equal(await fs.readFile(path.join(options.slotPath, 'release-marker'), 'utf8'), 'release');
+});
+
+test('[G] Second dev/prod (changed false): no lockInfo', async t => {
+  const options = await createFixture(t);
+
+  await switchToDevelopment(options);
+  const secondDev = await switchToDevelopment(options);
+  assert.equal(secondDev.changed, false);
+  assert.equal(secondDev.lockInfo, undefined);
+
+  await switchToProduction(options);
+  const secondProd = await switchToProduction(options);
+  assert.equal(secondProd.changed, false);
+  assert.equal(secondProd.lockInfo, undefined);
+});
+
+test('[H] prod interrupted unlink then rename failure: original dangling link restored', async t => {
+  const options = await createFixture(t);
+  const devResult = await switchToDevelopment(options);
+  const originalLinkTarget = await fs.readlink(options.slotPath);
+  await fs.rm(options.sourceRoot, {recursive: true});
+
+  const failingFileSystem = {
+    ...fs,
+    rename: async (source, destination) => {
+      if (source === devResult.backupPath && destination === options.slotPath) {
+        throw new Error('simulated restore failure');
+      }
+
+      return fs.rename(source, destination);
+    },
+  };
+
+  await assert.rejects(
+    switchToProduction({...options, fileSystem: failingFileSystem}),
+    /simulated restore failure/u,
+  );
+
+  const restoredLink = await fs.readlink(options.slotPath);
+  assert.equal(restoredLink, originalLinkTarget);
+
+  const state = await inspectWorkflow(options);
+  assert.equal(state.mode, 'development-interrupted');
+});
