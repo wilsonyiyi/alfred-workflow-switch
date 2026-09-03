@@ -6,7 +6,7 @@ async function readBundleIdIfPresent(plistPath, fileSystem) {
   try {
     return await readWorkflowBundleId(plistPath, {fileSystem});
   } catch (error) {
-    if (error.code === 'ENOENT' || error.code === 'ENOTDIR') {
+    if (error.code === 'ENOENT' || error.code === 'ENOTDIR' || error.code === 'MISSING_BUNDLEID') {
       return undefined;
     }
 

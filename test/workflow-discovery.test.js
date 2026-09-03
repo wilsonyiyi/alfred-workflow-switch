@@ -23,6 +23,20 @@ test('findWorkflowSlotsByBundleId returns every matching Alfred slot', async t =
   ]);
 });
 
+test('findWorkflowSlotsByBundleId skips workflows with an empty bundleid', async t => {
+  const preferencesRoot = await createSandbox(t);
+  const workflowsRoot = path.join(preferencesRoot, 'workflows');
+  await writeWorkflow(path.join(workflowsRoot, 'user.workflow.target'), 'com.example.target');
+  await writeWorkflow(path.join(workflowsRoot, 'user.workflow.empty'), '');
+
+  assert.deepEqual(await findWorkflowSlotsByBundleId({
+    bundleId: 'com.example.target',
+    preferencesRoot,
+  }), [
+    path.join(workflowsRoot, 'user.workflow.target'),
+  ]);
+});
+
 test('assertWorkflowSlotPath rejects paths outside the workflows directory', () => {
   assert.throws(
     () => assertWorkflowSlotPath('/tmp/workflow', '/tmp/preferences'),
